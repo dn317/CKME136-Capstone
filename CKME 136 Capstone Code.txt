@@ -1,0 +1,757 @@
+#Install packages#
+install.packages(c("h2o","caret","lme4","ggalluvial","xgboost","jsonlite","lubridate","knitr","Rmisc","scales","countrycode","highcharter","glmnet","keras","forecast","zoo","magrittr","tidyverse","MASS","leaps","FNN"))
+
+library(data.table)
+library(h2o)
+library(caret)
+library(lme4)
+library(ggalluvial)
+library(xgboost)
+library(jsonlite)
+library(lubridate)
+library(knitr)
+library(Rmisc)
+library(scales)
+library(countrycode)
+library(highcharter)
+library(glmnet)
+library(keras)
+library(forecast)
+library(zoo)
+library(magrittr)
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggExtra)
+library(MASS)
+library(leaps)
+library(FNN)
+
+#Load data#
+tr <- read.csv("C:/Users/Eric/Documents/Ryerson Data Analytics Certificate/CKME136/train.csv",header=T, sep=",")
+tr <- setDT(tr)
+
+#Convert JSON columns(JSON columns are "device", "geoNetwork", "totals", "trafficSource")#
+tr_device <- paste("[", paste(tr$device, collapse = ","), "]") %>% fromJSON(flatten = T)
+tr_geoNetwork <- paste("[", paste(tr$geoNetwork, collapse = ","), "]") %>% fromJSON(flatten = T)
+tr_totals <- paste("[", paste(tr$totals, collapse = ","), "]") %>% fromJSON(flatten = T)
+tr_trafficSource <- paste("[", paste(tr$trafficSource, collapse = ","), "]") %>% fromJSON(flatten = T)
+
+#Combine to make the full data sets#
+tr <- tr %>%
+  cbind(tr_device, tr_geoNetwork, tr_totals, tr_trafficSource) %>%
+  select(-device, -geoNetwork, -totals, -trafficSource)
+  
+#Remove temporary training sets#
+rm(tr_device)
+rm(tr_geoNetwork)
+rm(tr_totals)
+rm(tr_trafficSource)
+
+#Identify missing values and convert to NA#
+na_vals <- c('unknown.unknown', '(not set)', 'not available in demo dataset', '(not provided)', '(none)', '<NA>')
+
+for(col in names(tr)) {
+  
+  set(tr, i=which(tr[[col]] %in% na_vals), j=col, value=NA)
+  
+}
+
+#Plot missing value#
+tr %>% summarise_all(funs(sum(is.na(.))/n()*100)) %>% 
+gather(key="feature", value="missing_pct") %>% 
+  ggplot(aes(x=reorder(feature,-missing_pct),y=missing_pct)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  labs(y = "Missing %", x = "Features") +
+  coord_flip() +
+  theme_minimal()
+  
+#Drop columns with 100% missing values#
+missing_value_pct<-sapply(tr,function(col)sum(is.na(col))/length(col))
+missing_del<-names(missing_value_pct[missing_value_pct==1])
+tr<-select(tr, -any_of(missing_del))
+
+#Correct data types#       
+tr %<>%
+  mutate(date = ymd(date),
+         fullVisitorId = as.character(fullVisitorId),
+         sessionId = as.character(sessionId),
+         visitId = as.character(visitId),
+         visitStartTime = as_datetime(visitStartTime),
+         hits = as.integer(hits),
+         pageviews = as.integer(pageviews),
+         transactionRevenue = as.numeric(transactionRevenue))
+         
+cat_cols <- c("channelGrouping","browser","operatingSystem","deviceCategory","continent","subContinent","country","region","metro","city","networkDomain","campaign","source","medium","keyword","referralPath","adContent","adwordsClickInfo.page","adwordsClickInfo.slot","adwordsClickInfo.gclId","adwordsClickInfo.adNetworkType")
+
+tr[, cat_cols] <- lapply(tr[, cat_cols,with=FALSE], as.factor)
+
+
+#Identify constant columns#
+fea_uniq_values <- sapply(tr, n_distinct,na.rm=TRUE)
+fea_del <- names(fea_uniq_values[fea_uniq_values == 1])
+
+#Remove constant columns#
+tr<-select(tr, -any_of(fea_del))
+
+#Describe numeric input columns#
+summary(tr[,c("visitNumber","hits","pageviews")])
+
+#Describe non-numeric input columns#
+tr <- setDT(tr)
+p1 <- tr[, .(n = .N), by=channelGrouping] %>%
+  ggplot(aes(x=reorder(channelGrouping, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='Channel Grouping',
+       y='Visits (000s)',
+       title='Visits by channelGrouping')
+
+p2 <- top_n(tr[, .(n = .N), by=browser],10,n) %>%
+  ggplot(aes(x=reorder(browser, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='browser',
+       y='Visits (000s)',
+       title='Top 10 Visits by browser')    
+
+p3 <- na.omit(top_n(tr[, .(n = .N), by=operatingSystem],11,n))%>%
+  ggplot(aes(x=reorder(operatingSystem, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 1), hjust=0.5))+
+  coord_flip() + 
+  labs(x='operatingSystem',
+       y='Visits (000s)',
+       title='Top 10 Visits by operatingSystem')           
+
+p4 <- tr[, .(n = .N), by=isMobile] %>%
+  ggplot(aes(x=reorder(isMobile, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='isMobile',
+       y='Visits (000s)',
+       title='Visits by isMobile')  
+
+p5 <- tr[, .(n = .N), by=deviceCategory] %>%
+  ggplot(aes(x=reorder(deviceCategory, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='deviceCategory',
+       y='Visits (000s)',
+       title='Visits by deviceCategory')  
+
+p6 <- na.omit(tr[, .(n = .N), by=continent]) %>%
+  ggplot(aes(x=reorder(continent, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='continent',
+       y='Visits (000s)',
+       title='Visits by continent')  
+
+p7 <- top_n(tr[, .(n = .N), by=subContinent],10,n) %>%
+  ggplot(aes(x=reorder(subContinent, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='subContinent',
+       y='Visits (000s)',
+       title='Top 10 Visits by subContinent')        
+
+p8 <- top_n(tr[, .(n = .N), by=country],10,n) %>%
+  ggplot(aes(x=reorder(country, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='country',
+       y='Visits (000s)',
+       title='Top 10 Visits by country')  
+
+p9 <- na.omit(top_n(tr[, .(n = .N), by=region],11,n)) %>%
+  ggplot(aes(x=reorder(region, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='region',
+       y='Visits (000s)',
+       title='Top 10 Visits by region')  
+
+p10 <- na.omit(top_n(tr[, .(n = .N), by=metro],11,n)) %>%
+  ggplot(aes(x=reorder(metro, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='metro',
+       y='Visits (000s)',
+       title='Top 10 Visits by metro')  
+       
+p11 <- na.omit(top_n(tr[, .(n = .N), by=city],11,n)) %>%
+  ggplot(aes(x=reorder(city, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+   geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='city',
+       y='Visits (000s)',
+       title='Top 10 Visits by city')  
+
+p12 <- na.omit(top_n(tr[, .(n = .N), by=networkDomain],11,n)) %>%
+  ggplot(aes(x=reorder(networkDomain, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='networkDomain',
+       y='Visits (000s)',
+       title='Top 10 Visits by networkDomain')
+
+p13 <- na.omit(top_n(tr[, .(n = .N), by=campaign],11,n)) %>%
+  ggplot(aes(x=reorder(campaign, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 3), hjust=0.2))+
+  coord_flip() + 
+  labs(x='campaign',
+       y='Visits (000s)',
+       title='Visits by campaign')
+
+p14 <- na.omit(top_n(tr[, .(n = .N), by=source],10,n)) %>%
+  ggplot(aes(x=reorder(source, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='source',
+       y='Visits (000s)',
+       title='Top 10 Visits by source')
+
+p15 <- na.omit(top_n(tr[, .(n = .N), by=medium],11,n)) %>%
+  ggplot(aes(x=reorder(medium, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='medium',
+       y='Visits (000s)',
+       title='Visits by medium')
+
+p16 <- na.omit(top_n(tr[, .(n = .N), by=keyword],11,n)) %>%
+  ggplot(aes(x=reorder(keyword, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 1), hjust=0.5))+
+  coord_flip() + 
+  labs(x='keyword',
+       y='Visits (000s)',
+       title='Top 10 Visits by keyword')
+
+p17 <- na.omit(top_n(tr[, .(n = .N), by=referralPath],11,n)) %>%
+  ggplot(aes(x=reorder(referralPath, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 0), hjust=0.5))+
+  coord_flip() + 
+  labs(x='referralPath',
+       y='Visits (000s)',
+       title='Top 10 Visits by referralPath')
+
+p18 <- na.omit(top_n(tr[, .(n = .N), by=adContent],11,n)) %>%
+  ggplot(aes(x=reorder(adContent, n), y=n)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n,digits = 1), hjust=0))+
+  coord_flip() + 
+  labs(x='adContent',
+       y='Visits',
+       title='Top 10 Visits by adContent')
+
+p19 <- na.omit(top_n(tr[, .(n = .N), by=adwordsClickInfo.page],10,n)) %>%
+  ggplot(aes(x=reorder(adwordsClickInfo.page, n), y=n)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n,digits = 3), hjust=0))+
+  coord_flip() + 
+  labs(x='adwordsClickInfo.page',
+       y='Visits',
+       title='Visits by adwordsClickInfo.page')
+
+p20 <- na.omit(top_n(tr[, .(n = .N), by=adwordsClickInfo.slot],10,n)) %>%
+  ggplot(aes(x=reorder(adwordsClickInfo.slot, n), y=n)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n,digits =1 ), hjust=0))+
+  coord_flip() + 
+  labs(x='adwordsClickInfo.slot',
+       y='Visits',
+       title='Visits by adwordsClickInfo.slot')
+
+p21 <- na.omit(top_n(tr[, .(n = .N), by=adwordsClickInfo.gclId],11,n)) %>%
+  ggplot(aes(x=reorder(adwordsClickInfo.gclId, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n/1000,digits = 2), hjust=0))+
+  coord_flip() + 
+  labs(x='adwordsClickInfo.gclId',
+       y='Visits (000s)',
+       title='Top 10 Visits by adwordsClickInfo.gclId')    
+
+p22 <- na.omit(top_n(tr[, .(n = .N), by=adwordsClickInfo.adNetworkType],11,n)) %>%
+  ggplot(aes(x=reorder(adwordsClickInfo.adNetworkType, n), y=n)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  geom_text(aes(label=round(n,digits = 0), hjust=0))+
+  coord_flip() + 
+  labs(x='adwordsClickInfo.adNetworkType',
+       y='Visits',
+       title='Visits by adwordsClickInfo.adNetworkType')         
+
+grid.arrange(p1,p2,p3,p4,p5,nrow=2)
+grid.arrange(p6,p7,p8,p9,p10,p11,nrow=2)
+grid.arrange(p12,p13,p14,p15,p16,p17,nrow=2)
+grid.arrange(p18,p19,nrow=2)
+grid.arrange(p20,p22,nrow=2)
+
+#Target variable time range#
+time_range <- range(tr$date)
+print(time_range)
+
+#Target Variable (transactionRevenue) descriptive statistics
+y <- tr$transactionRevenue/1e6
+summary(y)
+
+#Percentage of visits with non-zero transaction revenue
+y[is.na(y)] <- 0
+length(y[y!=0])
+non_zero_rev <- (length(y[y!=0])/length(y))
+sprintf("%1.2f%%", non_zero_rev*100)
+(sum(y))
+(sum(y))/length(y[y!=0])
+
+#Distribution of revenue<1000USD
+options(repr.plot.height=4)
+tr %>% filter(transactionRevenue/1e6 >0 & transactionRevenue/1e6 <1000) %>%
+ggplot(aes(x=transactionRevenue/1e6)) +
+        geom_histogram(fill='steelblue', binwidth=10) +
+        scale_x_continuous(breaks= seq(0, 1000, by=100), labels = comma)
+
+#Distribution of log revenue      
+tr %>% 
+  ggplot(aes(x=log(transactionRevenue/1e6), y=..density..)) + 
+  geom_histogram(fill='steelblue', na.rm=TRUE, bins=40) + 
+  geom_density(aes(x=log(transactionRevenue/1e6)), fill='orange', color='orange', alpha=0.3, na.rm=TRUE) + 
+  labs(
+    title = 'Distribution of transaction revenue',
+    x = 'Natural log of transaction revenue'
+  )
+  
+#Bivariate analysis (correlation)
+num_col<-(tr[,c("visitNumber","hits","pageviews","transactionRevenue")])
+num_col$pageviews<-replace_na(num_col$pageviews,0)
+num_col$transactionRevenue<-replace_na(num_col$transactionRevenue,0)
+cor(num_col)
+
+
+
+###Data Exploration###
+setDT(tr)
+
+#Pageveiws & Revenue#
+#sessions with more than 30 pageviews have frequencies of less than 1,000. These are hardly visible therefore excluded from the plot.
+
+options(repr.plot.height=4)
+p1 <- tr %>% filter(!is.na(tr$pageviews) & pageviews <=30) %>% 
+ggplot(aes(x=pageviews)) +
+    geom_histogram(fill='steelblue', binwidth=1) +
+    scale_y_continuous(breaks=seq(0, 500000, by=100000), label=comma) +
+    scale_x_continuous(breaks=seq(0, 30, by=5)) +
+    coord_cartesian(x=c(0,30))
+
+p2 <- tr %>% filter(!is.na(tr$pageviews) & pageviews <=30) %>% group_by(pageviews) %>%
+    ggplot(aes(x=pageviews, y=transactionRevenue/1e9)) +
+    geom_bar(stat='summary', fun.y = "sum", fill='steelblue') +
+    scale_x_continuous(breaks=seq(0, 30, by=5)) +
+    coord_cartesian(x=c(0,30)) + labs(y="sum of revenues (000s)")
+
+p3 <- tr %>% filter(!is.na(tr$pageviews) & pageviews <=30) %>% group_by(pageviews) %>%
+    ggplot(aes(x=pageviews, y=transactionRevenue/1e6)) +
+    geom_bar(stat='summary', fun.y = "mean", fill='steelblue') +
+    scale_x_continuous(breaks=seq(0, 30, by=5)) +
+    coord_cartesian(x=c(0,30)) + labs(y="mean of revenues")
+
+grid.arrange(p1, p2, p3, nrow=3)
+
+##Channel & Devise Features##
+
+#Visit, total revenue, mean revenue by [channel]
+g1 <- tr[, .(n = .N), by=channelGrouping] %>%
+  ggplot(aes(x=reorder(channelGrouping, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  coord_flip() + 
+  labs(x='Channel Grouping',
+       y='Visits (000s)',
+       title='Visits by channel grouping')
+
+g2 <- tr[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by=channelGrouping] %>%
+  ggplot(aes(x=reorder(channelGrouping, revenue), y=revenue/1e9)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  coord_flip() + 
+  labs(x='',
+       y='Revenue (dollars, 000s)',
+       title='Total revenue by channel grouping')
+
+g3 <- tr[, .(meanRevenue = mean(transactionRevenue, na.rm=TRUE)), by=channelGrouping] %>%
+  ggplot(aes(x=reorder(channelGrouping, meanRevenue), y=meanRevenue/1e6)) + 
+  geom_bar(stat='identity', fill='steelblue') + 
+  coord_flip() + 
+  labs(x='', 
+       y='Revenue (dollars)',
+       title='Mean revenue by channel grouping')
+
+grid.arrange(g1,g2, g3, ncol = 3)
+
+#Visit, total revenue, mean revenue by [deviceCategory]
+g1 <- tr[, .(n = .N), by=deviceCategory] %>%
+  ggplot(aes(x=reorder(deviceCategory, n), y=n/1000)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  coord_flip() + 
+  labs(x='deviceCategory',
+       y='Visits (000s)',
+       title='Visits by deviceCategory')
+
+g2 <- tr[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by=deviceCategory] %>%
+  ggplot(aes(x=reorder(deviceCategory, revenue), y=revenue/1e9)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  coord_flip() + 
+  labs(x='',
+       y='Revenue (dollars, 000s)',
+       title='Total revenue by deviceCategory')
+
+g3 <- tr[, .(meanRevenue = mean(transactionRevenue, na.rm=TRUE)), by=deviceCategory] %>%
+  ggplot(aes(x=reorder(deviceCategory, meanRevenue), y=meanRevenue/1e6)) + 
+  geom_bar(stat='identity', fill='steelblue') + 
+  coord_flip() + 
+  labs(x='', 
+       y='Revenue (dollars)',
+       title='Mean revenue by deviceCategory')
+
+grid.arrange(g1,g2, g3, ncol = 3)
+
+#Visit, total revenue, mean revenue by [operatingSystem]
+g1 <- tr[, .(n=.N), by=operatingSystem][
+  n > 0.001
+] %>%
+  ggplot(aes(x=reorder(operatingSystem, -n), y=n/1000)) + 
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Operating System', 
+       y='# of visits in data set (000s)',
+       title= 'Visits by device operating system') + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+g2 <- tr[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by=operatingSystem][
+  revenue > 0, 
+] %>%
+  ggplot(aes(x=reorder(operatingSystem, -revenue), y=revenue/1e9)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Operating System',
+       y='Revenue (dollars, 000s)',
+       title='Total revenue by device operating system') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+g3 <- tr[, .(meanRevenue = mean(transactionRevenue, na.rm=TRUE)), by=operatingSystem] [
+  meanRevenue > 0, 
+] %>%
+  ggplot(aes(x=reorder(operatingSystem, -meanRevenue), y=meanRevenue/1e6)) +
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Operating System',
+       y='Mean Revenue (unit dollars)',
+       title='Mean revenue by device operating system') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+grid.arrange(g1, g2, g3, nrow=3)
+
+##Geographic Features##
+
+#Group by country and calculate total transaction revenue (log)
+by_country <- tr[, .(n = .N, revenue = log(sum(transactionRevenue/1e6, na.rm=TRUE))), by = country]
+by_country$iso3 <- countrycode(by_country$country, origin='country.name', destination='iso3c')
+by_country[, rev_per_visit := revenue / n]
+
+#Create the highcharter map of revenue by country
+highchart() %>%
+    hc_add_series_map(worldgeojson, by_country, value = 'revenue', joinBy = 'iso3') %>%
+    hc_title(text = 'Total transaction revenue by country (natural log)') %>%
+    hc_subtitle(text = "August 2016 to August 2017") %>%
+    hc_tooltip(useHTML = TRUE, headerFormat = "",
+        pointFormat = "{point.country}: ${point.revenue:.0f}")
+        
+##Traffic Source##
+
+#Visit, total revenue, mean revenue by [source]
+g1 <- na.omit(top_n(tr[, .(visits = .N), by=source],5,visits))%>%
+  ggplot(aes(x=reorder(source, visits), y=visits / 1000)) + 
+  geom_bar(stat='identity', fill='steelblue') + 
+  coord_flip() + 
+  labs(
+    x='Source',
+    y='Visits (000s)',
+    title='Top 5 visits by source')
+
+g2 <- na.omit(top_n(tr[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by = source],5,revenue))%>%
+  ggplot(aes(x=reorder(source, revenue), y=revenue / 1e9)) + 
+  geom_bar(stat='identity', fill='steelblue') + 
+  coord_flip() + 
+  labs(
+    x='',
+    y='Transaction revenue (dollars, 000s)',
+    title='Top 5 total revenue by source')
+    
+g3 <- na.omit(top_n(tr[, .(meanRevenue = mean(transactionRevenue, na.rm=TRUE)), by=source],5, meanRevenue)) %>%
+  ggplot(aes(x=reorder(source, meanRevenue), y=meanRevenue/1e6)) + 
+  geom_bar(stat='identity', fill='steelblue') + 
+  coord_flip() + 
+  labs(x='', 
+       y='Revenue (dollars)',
+       title='Top 5 mean revenue by source')
+
+grid.arrange(g1, g2,g3, ncol=3)
+
+##Time & Revenue##
+
+#Daily visit and revenue
+setDT(tr)
+
+g1 <- tr[, .(n = .N), by=date] %>%
+  ggplot(aes(x=date, y=n)) + 
+  geom_line(color='steelblue') +
+  geom_smooth(color='orange') + 
+  labs(
+    x='',
+    y='Visits (000s)',
+    title='Daily visits'
+  )
+
+g2 <- tr[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by=date] %>%
+  ggplot(aes(x=date, y=revenue/1e9)) + 
+  geom_line(color='steelblue') +
+  geom_smooth(color='orange') + 
+  labs(
+    x='',
+    y='Revenue (dollars, 000s)',
+    title='Daily transaction revenue'
+  )
+
+grid.arrange(g1, g2, nrow=2)
+
+#Transacion and Revenue by [hour of the day]
+g1 <-
+  tr[, .(visitHour = hour(visitStartTime))][
+    , .(visits = .N), by = visitHour] %>%
+  ggplot(aes(x = visitHour, y = visits / 1000)) +
+  geom_line(color = 'steelblue', size = 1) +
+  geom_point(color = 'steelblue', size = 2) +
+  labs(
+  x = 'Hour of day',
+  y = 'Visits (000s)',
+  title = 'Aggregate visits by hour of day (UTC)',
+  subtitle = 'August 1, 2016 to August 1, 2017'
+  
+  )
+
+g2 <-
+  tr[, .(transactionRevenue, visitHour = hour(visitStartTime))][
+    , .(revenue = sum(transactionRevenue, na.rm =
+  T)), by = visitHour] %>%
+  ggplot(aes(x = visitHour, y = revenue / 1e9)) +
+  geom_line(color = 'steelblue', size = 1) +
+  geom_point(color = 'steelblue', size = 2) +
+  labs(
+  x = 'Hour of day',
+  y = 'Transaction revenue (000s)',
+  title = 'Aggregate revenue by hour of day (UTC)',
+  subtitle = 'August 1, 2016 to August 1, 2017'
+
+  )
+
+grid.arrange(g1, g2, nrow = 2)        
+
+#Transacion and Revenue by [weekday]
+tr$weekday <- wday(tr$date, label=TRUE)
+options(repr.plot.height=4)
+g1 <- tr[, .(n=.N), by=weekday]%>%
+  ggplot(aes(x=weekday, y=n/1000)) + 
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Weekday', 
+       y='# of visits (000s)',
+       title= 'Visits by weekday') + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+g2 <- tr[, .(revenue = sum(transactionRevenue, na.rm=TRUE)), by=weekday]%>%
+  ggplot(aes(x=weekday, y=revenue / 1e9)) + 
+  geom_bar(stat='identity', fill='steelblue') +
+  labs(x='Weekday', 
+       y='Transaction revenue (dollars, 000s)',
+       title= 'Total revenue') + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+grid.arrange(g1, g2, nrow = 1)
+
+
+##Timeseries ARIMA Model##
+
+tr %>% 
+  bind_cols(tibble(revenue = y)) %>% 
+  group_by(date) %>%  
+  summarize(sum_revenue = log1p(sum(revenue))) %>% 
+  ungroup() %>% 
+  with(zoo(sum_revenue, order.by = date)) ->
+  revenue
+
+tr_arima <- revenue[index(revenue)<"2017-06-01"]
+te_arima <- revenue[index(revenue)>"2017-05-31"]
+
+m_aa <- auto.arima(tr_arima)
+summary(m_aa)
+
+revenue %>% 
+  autoplot() + 
+  geom_line() +
+  geom_smooth() + 
+  labs(x = "", y = "log(revenue)") +
+  theme_minimal()
+
+
+h <- max(index(te_arima)) - min(index(te_arima)) + 1
+fcst_arima=forecast(m_aa, h = h)
+
+forecast(m_aa, h = h) %>% 
+  autoplot() + 
+  theme_minimal()
+  
+rmse_arima <- sqrt(sum((fcst_arima$mean-as.vector(te_arima))^2)/length(te_arima))
+
+
+##Regression Data Preparation##
+
+#Transform target variable and subset selected features#
+tr$log_rev <- log1p(tr$transactionRevenue)
+tr$log_rev[is.na(tr$log_rev)] <- 0
+
+tr$year <- as.factor(year(tr$visitStartTime))
+tr$month <- as.factor(month(tr$visitStartTime))
+tr$wday <- as.factor(wday(tr$visitStartTime))
+tr$hour <- as.factor(hour(tr$visitStartTime))
+
+#Plot missing value
+tr %>% summarise_all(funs(sum(is.na(.))/n()*100)) %>% 
+gather(key="feature", value="missing_pct") %>% 
+  ggplot(aes(x=reorder(feature,-missing_pct),y=missing_pct)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  labs(y = "Missing %", x = "Features") +
+  coord_flip() +
+  theme_minimal()
+
+tr %>% summarise_all(funs(sum(is.na(.)))) -> missing_val
+missing_val <- sort(missing_val)
+
+#Subset selected features#
+data_reg <- subset(tr, select= c(date, channelGrouping, visitNumber, browser, operatingSystem, deviceCategory, continent, country, pageviews, campaign, source, log_rev, year, month, wday, hour))
+
+#Reduce levels of factor features#
+data_reg <- data_reg %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0L, .)))
+
+data_reg$browser <- fct_lump_n(data_reg$browser,n=5, other_level = "Other")
+data_reg$operatingSystem <- fct_lump_n(data_reg$operatingSystem,n=5, other_level = "Other")
+data_reg$country <- fct_lump_n(data_reg$country,n=5, other_level = "Other")
+data_reg$source <- fct_lump_n(data_reg$source,n=5, other_level = "Other")
+data_reg$campaign <- as.factor(ifelse(is.na(data_reg$campaign),0L,1L))
+data_reg$wday <- as.factor(ifelse(data_reg$wday %in% c(6,7),0L,1L))
+data_reg$hour <- as.factor(ifelse(data_reg$hour %in% c(0:12),0L,1L))
+
+data_reg <- na.omit(data_reg)
+
+#Subset to create training and testing set#
+sub_reg <-  sample(nrow(data_reg), floor(nrow(data_reg)*0.7)) 
+tr_reg <- data_reg[sub_reg,]
+te_reg <- data_reg[-sub_reg,]
+
+tr_reg <- subset(tr_reg, select=-c(date))
+te_log_rev<-te_reg$log_rev
+te_reg <- subset(te_reg, select=-c(date,log_rev))
+
+##Linear Model##
+
+#All features#
+m_mlr <- lm(log_rev~., data=tr_reg) 
+fcst_mlr <- predict(m_mlr, interval="prediction", newdata =te_reg)
+rmse_mlr <- sqrt(sum((fcst_mlr[,"fit"] - te_log_rev)^2)/length(te_log_rev))
+errors_mlr <- fcst_mlr[,"fit"] - te_log_rev
+hist(errors_mlr)
+
+#One feature - pageviews#
+m_mlr1 <- lm(log_rev~pageviews, data=tr_reg) 
+fcst_mlr1 <- predict(m_mlr1, interval="prediction", newdata =te_reg)
+rmse_mlr1 <- sqrt(sum((fcst_mlr1[,"fit"] - te_log_rev)^2)/length(te_log_rev))
+errors_mlr1 <- fcst_mlr1[,"fit"] - te_log_rev
+hist(errors_mlr1)
+
+#Auto feature selection#
+null <- lm(log_rev~1,data=tr_reg)
+step_auto <- stepAIC(null, scope=list(lower=null, upper=m_mlr))
+summary(step_auto)
+
+m_mlr_auto <- lm(log_rev ~ pageviews + source + operatingSystem + 
+    country + month + hour + browser + visitNumber + campaign + 
+    channelGrouping + year + deviceCategory, data = tr_reg) 
+fcst_mlr_auto <- predict(m_mlr_auto, interval="prediction", newdata =te_reg)
+rmse_mlr_auto <- sqrt(sum((fcst_mlr_auto[,"fit"] - te_log_rev)^2)/length(te_log_rev))
+errors_mlr_auto <- fcst_mlr_auto[,"fit"] - te_log_rev
+hist(errors_mlr_auto)
+
+##KNN##
+# Below I convert the 2nd to the 11th columns to numeric
+tr_reg_num <- sapply(tr_reg, as.numeric)
+tr_reg_num <- as.data.frame(tr_reg_num)
+te_reg_num <- sapply(te_reg, as.numeric)
+te_reg_num <- as.data.frame(te_reg_num)
+
+m_knn <- knn.reg(train= tr_reg_num[,-11], 
+                test = te_reg_num,  
+                y = tr_reg_num[,11], 
+                k = 7 , 
+                algorithm="kd_tree")  
+
+fcst_knn <- m_knn$pred
+rmse_knn <- sqrt(sum((fcst_knn - te_log_rev)^2)/length(te_log_rev))
+errors_knn <- fcst_knn - te_log_rev
+hist(errors_knn)
+
+##XGBoosting##
+tr_xgb <- tr_reg %>% 
+  mutate_if(is.factor, as.integer)
+te_xgb <- te_reg %>% 
+  mutate_if(is.factor, as.integer)
+
+tr_xgb <- xgb.DMatrix(data = data.matrix(tr_xgb[,-11]), label=tr_xgb$log_rev)
+te_xgb <- xgb.DMatrix(data = data.matrix(te_xgb), label=te_log_rev)
+  
+p <- list(objective = "reg:linear",
+          booster = "gbtree",
+          eval_metric = "rmse",
+          nthread = 4,
+          eta = 0.05,
+          max_depth = 7,
+          min_child_weight = 5,
+          gamma = 0,
+          subsample = 0.8,
+          colsample_bytree = 0.7,
+          colsample_bylevel = 0.6,
+          nrounds = 2000)
+
+set.seed(0)
+m_xgb <- xgb.train(p, tr_xgb, p$nrounds, print_every_n = 100)
+
+xgb.importance(model = m_xgb) %>% 
+  xgb.plot.importance
+  
+fcst_xgb <- predict(m_xgb, te_xgb)
+rmse_xgb <- sqrt(sum((fcst_xgb - te_log_rev)^2)/length(te_log_rev))
+errors_xgb <- fcst_xgb - te_log_rev
+hist(errors_xgb)
+
